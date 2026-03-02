@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nezaam Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#070a0f;font-family:'Inter',sans-serif;color:#e2e8f0;min-height:100vh}
+  ::-webkit-scrollbar{width:5px;height:5px}
+  ::-webkit-scrollbar-track{background:#0d1117}
+  ::-webkit-scrollbar-thumb{background:#1e2d3d;border-radius:3px}
+  .mono{font-family:'JetBrains Mono',monospace}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef, useMemo } = React;
+
+/* ── localStorage helpers ─────────────────────────────── */
+const LS = {
+  get: (k, fallback=null) => { try { const v=localStorage.getItem(k); return v?JSON.parse(v):fallback; } catch{ return fallback; }},
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch{} },
+};
+
+/* ── constants ────────────────────────────────────────── */
+const STAGES   = ["New","Reviewing","Applied","Interview","Offer","Rejected","Ghosted"];
+const S_COLOR  = {New:"#3b82f6",Reviewing:"#f59e0b",Applied:"#8b5cf6",Interview:"#06b6d4",Offer:"#22c55e",Rejected:"#ef4444",Ghosted:"#475569"};
+const S_ICON   = {New:"🆕",Reviewing:"👀",Applied:"📤",Interview:"🎯",Offer:"🎉",Rejected:"❌",Ghosted:"👻"};
+
+/* ── AI call ──────────────────────────────────────────── */
+async function callAI(apiKey, system, user, provider="openai") {
+  if (provider === "openai") {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","Authorization":`Bearer ${apiKey}`},
+      body:JSON.stringify({model:"gpt-4o-mini",max_tokens:900,messages:[{role:"system",content:system},{role:"user",content:user}]})
+    });
+    if (!r.ok) { const e=await r.json(); throw new Error(e.error?.message||`API ${r.status}`); }
+    const d = await r.json();
+    return d.choices?.[0]?.message?.content || "";
+  } else {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+      body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:900,system,messages:[{role:"user",content:user}]})
+    });
+    if (!r.ok) throw new Error(`API ${r.status}`);
+    const d = await r.json();
+    return d.content?.map(b=>b.text||"").join("") || "";
+  }
+}
+
+/* ══════════════════════════════════════════════════════ */
+function App() {
+  const [jobs,    setJobs]    = useState(() => LS.get("nz_jobs", []));
+  const [tracker, setTracker] = useState(() => LS.get("nz_tracker", {}));
+  const [apiKey,  setApiKey]  = useState(() => LS.get("nz_apikey",""));
+  const [provider, setProvider] = useState(() => LS.get("nz_provider","openai"));
+  const [view,    setView]    = useState("list");
+  const [sel,     setSel]     = useState(null);
+  const [filter,  setFilter]  = useState({search:"",stage:"all",sponsor:"all"});
+  const [aiOut,   setAiOut]   = useState("");
+  const [aiMode,  setAiMode]  = useState("email");
+  const [aiLoad,  setAiLoad]  = useState(false);
+  const [note,    setNote]    = useState("");
+  const [toast,   setToast]   = useState(null);
+  const [showKey, setShowKey] = useState(false);
+  const fileRef = useRef();
+
+  /* persist */
+  useEffect(()=>{ LS.set("nz_jobs",jobs); },    [jobs]);
+  useEffect(()=>{ LS.set("nz_tracker",tracker);},[tracker]);
+  useEffect(()=>{ LS.set("nz_apikey",apiKey);  },[apiKey]);
+  useEffect(()=>{ LS.set("nz_provider",provider); },[provider]);
+
+  const flash = (msg,type="ok") => { setToast({msg,type}); setTimeout(()=>setToast(null),2800); };
+
+  /* import */
+  const handleImport = async e => {
+    const f = e.target.files?.[0]; if(!f) return;
+    try {
+      const txt  = await f.text();
+      const data = JSON.parse(txt);
+      const arr  = Array.isArray(data) ? data : [];
+      setJobs(arr);
+      flash(`✅ Imported ${arr.length} jobs`);
+    } catch { flash("❌ Invalid JSON","err"); }
+    e.target.value="";
+  };
+
+  /* tracker updates */
+  const setStage = useCallback((id,stage)=>{
+    setTracker(t=>{ const u={...t,[id]:{...(t[id]||{}),stage,updatedAt:new Date().toISOString()}}; LS.set("nz_tracker",u); return u; });
+    flash(`${S_ICON[stage]} ${stage}`);
+  },[]);
+
+  const saveNote = useCallback((id,text)=>{
+    setTracker(t=>{ const u={...t,[id]:{...(t[id]||{}),note:text}}; LS.set("nz_tracker",u); return u; });
+  },[]);
+
+  /* derived */
+  const stageCounts = useMemo(()=>
+    STAGES.reduce((a,s)=>{a[s]=jobs.filter(j=>(tracker[j.id]?.stage||"New")===s).length;return a;},{})
+  ,[jobs,tracker]);
+
+  const filteredJobs = useMemo(()=>jobs.filter(j=>{
+    const stage = tracker[j.id]?.stage||"New";
+    if(filter.stage!=="all" && stage!==filter.stage) return false;
+    if(filter.sponsor==="yes" && j.sponsorship!==true) return false;
+    if(filter.search){
+      const q=filter.search.toLowerCase();
+      if(!(j.title?.toLowerCase().includes(q)||j.company?.toLowerCase().includes(q))) return false;
+    }
+    return true;
+  }),[jobs,tracker,filter]);
+
+  const hotCos = useMemo(()=>{
+    const cnt={};
+    jobs.forEach(j=>{ if(j.company?.trim()) cnt[j.company]=(cnt[j.company]||0)+1; });
+    return Object.entries(cnt).filter(([,n])=>n>=2).sort((a,b)=>b[1]-a[1]).slice(0,30);
+  },[jobs]);
+
+  const applied    = Object.values(tracker).filter(t=>t.stage==="Applied").length;
+  const interviews = Object.values(tracker).filter(t=>t.stage==="Interview").length;
+  const offers     = Object.values(tracker).filter(t=>t.stage==="Offer").length;
+  const withEmail  = jobs.filter(j=>j.contacts?.some(c=>c.email)).length;
+
+  /* AI */
+  const runAI = async job => {
+    if(!job) return;
+    if(!apiKey){ flash("⚠️ Add API key in Settings","err"); setShowKey(true); return; }
+    setAiLoad(true); setAiOut("");
+    const isUK = job.profile?.includes("🇬🇧");
+    const contacts = job.contacts?.filter(c=>c.email).map(c=>c.name).join(", ")||"Hiring Manager";
+    try {
+      if(aiMode==="email"){
+        const r = await callAI(apiKey,
+          "Write concise job application emails under 200 words. Professional but direct. No fluff. Subject line first.",
+          `Write a ${isUK?"UK Skilled Worker sponsorship":"international relocation"} application email:
+Job: ${job.title} at ${job.company}, ${job.location}
+Contact: ${contacts}
+Salary: ${job.salary||"not listed"}
+
+Applicant — Malik Ibrahim, Manchester UK:
+- MSc Project & Programme Management, University of Chester (2025)
+- BSc Electrical Engineering, HITEC University (2020)
+- Managed 130+ Amazon accounts, led team of 7
+- Built AI automation pipelines (Python, APIs)
+- ${isUK?"Needs Skilled Worker visa sponsorship from July 2026":"Can relocate immediately"}
+Write sharp direct email. Subject line then body.`,provider);
+        setAiOut(r);
+      } else if(aiMode==="cv"){
+        const r = await callAI(apiKey,
+          "Write ATS-optimised CV bullet points. Output ONLY the bullets, no intro text.",
+          `4 CV bullets for Malik applying to: ${job.title} at ${job.company}
+Job snippet: ${job.description?.slice(0,350)||"N/A"}
+His experience: managed 130+ Amazon accounts + 7-person team, built Python automation bots and AI video pipeline, MSc PM dissertation on solar market risk, BSc EE.
+Strong action verbs + measurable results.`,provider);
+        setAiOut(r);
+      } else {
+        const r = await callAI(apiKey,
+          "Be direct. Score 0-10 and give a 3-line strategy. Format strictly: Score: X/10\nWhy: ...\nStrategy: ...",
+          `Score this job for Malik Ibrahim (0-10):
+Job: ${job.title} at ${job.company} — ${job.profile}
+Sponsorship: ${job.sponsorship===true?"Confirmed":job.sponsorship===false?"No":"Unknown"}
+Description: ${job.description?.slice(0,300)||"N/A"}
+Malik: MSc PM Chester UK, BSc EE, 130+ accounts managed, Python automation, no UK domain work experience, PSW visa expires July 2026.`,provider);
+        setAiOut(r);
+      }
+    } catch(e){ setAiOut(`Error: ${e.message}`); }
+    setAiLoad(false);
+  };
+
+  /* ── styles ─────────────────────────────────────────── */
+  const css = `
+    .card{background:#0d1117;border:1px solid #1a2332;border-radius:9px;transition:border-color .18s}
+    .card:hover{border-color:#00d4aa33}
+    .card.sel{border-color:#00d4aa}
+    .btn{border:none;cursor:pointer;border-radius:7px;font-family:'Inter',sans-serif;font-weight:600;transition:all .15s}
+    .nbtn{background:none;border:none;cursor:pointer;font-family:'Inter',sans-serif;font-size:13px;padding:8px 13px;border-radius:7px;transition:all .18s;color:#475569}
+    .nbtn:hover{background:#ffffff0d;color:#94a3b8}
+    .nbtn.act{background:#00d4aa18;color:#00d4aa}
+    input,select,textarea{background:#0d1117;border:1px solid #1a2332;color:#e2e8f0;border-radius:7px;font-family:'Inter',sans-serif;font-size:13px;outline:none;transition:border-color .15s}
+    input:focus,select:focus,textarea:focus{border-color:#00d4aa44}
+    .tag{display:inline-block;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:700;letter-spacing:.3px}
+    .pill{padding:5px 12px;border-radius:20px;border:1px solid #1a2332;background:#0d1117;color:#475569;cursor:pointer;font-size:12px;font-family:'Inter',sans-serif;transition:all .15s}
+    .pill:hover{border-color:#334155;color:#94a3b8}
+    .pill.on{background:#00d4aa18;border-color:#00d4aa55;color:#00d4aa;font-weight:600}
+    .sbadge{padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700}
+    .aio{white-space:pre-wrap;font-size:12px;line-height:1.8;color:#94a3b8;background:#080b10;border:1px solid #1a2332;border-radius:8px;padding:14px;max-height:280px;overflow-y:auto;font-family:'JetBrains Mono',monospace}
+    .pbar{height:3px;background:#1a2332;border-radius:2px;overflow:hidden;margin-top:6px}
+    .pfill{height:100%;border-radius:2px;transition:width .4s}
+    .crow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:9px 12px;background:#080b10;border-radius:7px;border:1px solid #1a2332;margin-bottom:5px;font-size:12px}
+    .cpbtn{padding:3px 9px;background:#1a2332;border:1px solid #252f3f;border-radius:4px;color:#94a3b8;font-size:11px;cursor:pointer;font-family:'Inter',sans-serif}
+    .cpbtn:hover{background:#252f3f;color:#e2e8f0}
+    @media(max-width:700px){.dskt{display:none!important}.split{grid-template-columns:1fr!important}}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+    .fadein{animation:fadeIn .2s ease}
+  `;
+
+  /* ── render ─────────────────────────────────────────── */
+  return (
+    <div style={{background:"#070a0f",minHeight:"100vh"}}>
+      <style>{css}</style>
+
+      {/* TOAST */}
+      {toast && (
+        <div style={{position:"fixed",top:14,right:14,zIndex:9999,background:toast.type==="err"?"#300":"#0a2018",border:`1px solid ${toast.type==="err"?"#7f1d1d":"#166534"}`,color:toast.type==="err"?"#f87171":"#4ade80",padding:"9px 16px",borderRadius:8,fontSize:13,fontFamily:"'JetBrains Mono',monospace",animation:"fadeIn .2s"}} className="fadein">
+          {toast.msg}
+        </div>
+      )}
+
+      {/* HEADER */}
+      <div style={{background:"#0d1117",borderBottom:"1px solid #1a2332",padding:"0 16px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,position:"sticky",top:0,zIndex:100}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+          <span className="mono" style={{color:"#00d4aa",fontSize:15,fontWeight:700,padding:"13px 0",letterSpacing:"-0.5px"}}>
+            nezaam_tracker <span style={{color:"#1a2332",fontSize:11}}>v2</span>
+          </span>
+          <nav style={{display:"flex",gap:2}}>
+            {[["list","☰ Jobs"],["pipeline","⬡ Board"],["hot","🔥 Hot"],["stats","◎ Stats"]].map(([v,l])=>(
+              <button key={v} className={`nbtn${view===v?" act":""}`} onClick={()=>setView(v)}>{l}</button>
+            ))}
+          </nav>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",padding:"8px 0"}}>
+          <span style={{fontSize:11,color:"#334155"}} className="mono">{jobs.length} jobs · {applied} applied</span>
+          <button className="btn" onClick={()=>setShowKey(s=>!s)} style={{background:"#1a2332",color:"#64748b",padding:"7px 12px",fontSize:12}}>⚙ API</button>
+          <input ref={fileRef} type="file" accept=".json" onChange={handleImport} style={{display:"none"}}/>
+          <button className="btn" onClick={()=>fileRef.current?.click()} style={{background:"#00d4aa",color:"#000",padding:"7px 14px",fontSize:12}}>⬆ Import JSON</button>
+        </div>
+      </div>
+
+      {/* API KEY PANEL */}
+      {showKey && (
+        <div style={{background:"#0a1020",borderBottom:"1px solid #1a2332",padding:"12px 16px",display:"flex",flexWrap:"wrap",gap:10,alignItems:"center"}}>
+          <select value={provider} onChange={e=>setProvider(e.target.value)} style={{padding:"7px 10px",fontSize:12,flexShrink:0}}>
+            <option value="openai">OpenAI (GPT-4o mini)</option>
+            <option value="anthropic">Anthropic (Claude Haiku)</option>
+          </select>
+          <input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)}
+            placeholder={provider==="openai"?"sk-proj-... (OpenAI key)":"sk-ant-api03-... (Anthropic key)"}
+            style={{flex:"1 1 280px",padding:"7px 12px",minWidth:200}}/>
+          <button className="btn" onClick={()=>setShowKey(false)} style={{background:"#00d4aa",color:"#000",padding:"7px 14px",fontSize:12}}>Save</button>
+          <span style={{fontSize:11,color:"#334155"}}>
+            {provider==="openai"?"Get key: platform.openai.com → API keys":"Get key: console.anthropic.com"}
+          </span>
+        </div>
+      )}
+
+      {/* EMPTY STATE */}
+      {jobs.length===0 && (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"75vh",gap:16,textAlign:"center",padding:24}}>
+          <div style={{fontSize:48}}>📂</div>
+          <div style={{fontSize:20,fontWeight:700,color:"#e2e8f0"}}>Drop your jobs_db.json here</div>
+          <div style={{fontSize:14,color:"#475569",maxWidth:360}}>Import the file your job hunter bot generates. All data stays on your device — nothing is sent anywhere.</div>
+          <button className="btn" onClick={()=>fileRef.current?.click()} style={{background:"#00d4aa",color:"#000",padding:"13px 28px",fontSize:15,marginTop:8}}>⬆ Import jobs_db.json</button>
+        </div>
+      )}
+
+      {/* ── LIST + DETAIL ── */}
+      {view==="list" && jobs.length>0 && (
+        <div className="split" style={{display:"grid",gridTemplateColumns:sel?"minmax(0,1fr) 420px":"1fr",height:"calc(100vh - 53px)"}}>
+
+          {/* list */}
+          <div style={{overflowY:"auto",borderRight:"1px solid #1a2332"}}>
+            <div style={{padding:"10px 14px",background:"#0a0d13",borderBottom:"1px solid #1a2332",display:"flex",flexWrap:"wrap",gap:8,position:"sticky",top:0,zIndex:10}}>
+              <input value={filter.search} onChange={e=>setFilter(f=>({...f,search:e.target.value}))}
+                placeholder="🔍 Search title / company..." style={{padding:"7px 11px",flex:"1 1 160px",minWidth:130}}/>
+              <select value={filter.stage} onChange={e=>setFilter(f=>({...f,stage:e.target.value}))} style={{padding:"7px 10px"}}>
+                <option value="all">All stages</option>
+                {STAGES.map(s=><option key={s} value={s}>{S_ICON[s]} {s} ({stageCounts[s]})</option>)}
+              </select>
+              <select value={filter.sponsor} onChange={e=>setFilter(f=>({...f,sponsor:e.target.value}))} style={{padding:"7px 10px"}}>
+                <option value="all">All</option>
+                <option value="yes">✅ Visa confirmed</option>
+              </select>
+              <span style={{fontSize:11,color:"#334155",alignSelf:"center"}} className="mono">{filteredJobs.length}</span>
+            </div>
+
+            {filteredJobs.map(j=>{
+              const t=tracker[j.id]||{};
+              const stage=t.stage||"New";
+              const col=S_COLOR[stage];
+              const hasEmail=j.contacts?.some(c=>c.email);
+              return (
+                <div key={j.id} className={`card${sel?.id===j.id?" sel":""}`}
+                  style={{borderRadius:0,border:"none",borderBottom:"1px solid #1a2332",padding:"11px 14px",cursor:"pointer"}}
+                  onClick={()=>{setSel(j);setNote(t.note||"");setAiOut("");}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:13,fontWeight:600,color:"#e2e8f0",marginBottom:4,lineHeight:1.3}}>{j.title}</div>
+                      <div style={{display:"flex",flexWrap:"wrap",gap:6,fontSize:11,color:"#475569"}}>
+                        <span style={{color:"#3b82f6",fontWeight:600}}>{j.company}</span>
+                        <span>📍{j.location}</span>
+                        {j.salary&&<span style={{color:"#22c55e"}}>💰{j.salary}</span>}
+                        {hasEmail&&<span style={{color:"#00d4aa"}}>📧</span>}
+                      </div>
+                    </div>
+                    <span className="sbadge" style={{background:col+"22",color:col,border:`1px solid ${col}44`,flexShrink:0}}>
+                      {S_ICON[stage]} {stage}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* detail */}
+          {sel && (
+            <div style={{overflowY:"auto",background:"#0a0d13",borderLeft:"1px solid #1a2332"}}>
+
+              {/* header */}
+              <div style={{padding:"14px 16px",borderBottom:"1px solid #1a2332",display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:15,fontWeight:700,color:"#e2e8f0",marginBottom:5,lineHeight:1.3}}>{sel.title}</div>
+                  <div style={{fontSize:12,color:"#3b82f6",fontWeight:600,marginBottom:4}}>{sel.company}</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:6,fontSize:11,color:"#475569"}}>
+                    <span>📍{sel.location}</span>
+                    {sel.salary&&<span style={{color:"#22c55e"}}>💰{sel.salary}</span>}
+                    <span>{sel.source}</span>
+                  </div>
+                </div>
+                <button onClick={()=>{setSel(null);setAiOut("");}} style={{background:"#1a2332",color:"#64748b",border:"none",borderRadius:6,padding:"6px 10px",cursor:"pointer",fontSize:14,flexShrink:0}}>✕</button>
+              </div>
+
+              {/* stage */}
+              <div style={{padding:"12px 16px",borderBottom:"1px solid #1a2332"}}>
+                <div style={{fontSize:10,color:"#334155",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>Stage</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                  {STAGES.map(s=>{
+                    const cur=tracker[sel.id]?.stage||"New";
+                    return <button key={s} className={`pill${cur===s?" on":""}`} onClick={()=>setStage(sel.id,s)}>{S_ICON[s]} {s}</button>;
+                  })}
+                </div>
+              </div>
+
+              {/* actions */}
+              <div style={{padding:"10px 16px",borderBottom:"1px solid #1a2332",display:"flex",gap:8}}>
+                <a href={sel.url} target="_blank" rel="noreferrer"
+                  style={{flex:1,background:"#00d4aa",color:"#000",padding:"9px",borderRadius:7,textAlign:"center",textDecoration:"none",fontSize:13,fontWeight:700,display:"block"}}>
+                  🔗 Open Job →
+                </a>
+                <button onClick={()=>setStage(sel.id,"Applied")}
+                  style={{background:"#8b5cf622",color:"#a78bfa",border:"1px solid #8b5cf644",padding:"9px 12px",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600,fontFamily:"'Inter',sans-serif"}}>
+                  📤 Applied
+                </button>
+              </div>
+
+              {/* contacts */}
+              <div style={{padding:"12px 16px",borderBottom:"1px solid #1a2332"}}>
+                <div style={{fontSize:10,color:"#334155",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>
+                  Contacts ({sel.contacts?.filter(c=>c.email||c.linkedin).length||0})
+                </div>
+                {(sel.contacts||[]).filter(c=>c.email||c.linkedin).map((c,i)=>(
+                  <div key={i} className="crow">
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontWeight:600,color:"#e2e8f0"}}>{c.name}</div>
+                      <div style={{color:"#475569",fontSize:11}}>{c.title}{c.confidence>0?` · ${c.confidence}%`:""}</div>
+                    </div>
+                    <div style={{display:"flex",gap:7,flexWrap:"wrap",alignItems:"center"}}>
+                      {c.email&&<><a href={`mailto:${c.email}`} style={{color:"#00d4aa",textDecoration:"none",fontSize:12}}>{c.email}</a>
+                        <button className="cpbtn" onClick={()=>{navigator.clipboard?.writeText(c.email);flash("📋 Copied!");}}>copy</button></>}
+                      {c.linkedin&&<a href={c.linkedin} target="_blank" rel="noreferrer" style={{color:"#3b82f6",textDecoration:"none",fontSize:12}}>🔗 LinkedIn</a>}
+                    </div>
+                  </div>
+                ))}
+                {!sel.contacts?.some(c=>c.email||c.linkedin)&&<div style={{fontSize:12,color:"#334155",fontStyle:"italic"}}>No contacts found.</div>}
+              </div>
+
+              {/* AI */}
+              <div style={{padding:"12px 16px",borderBottom:"1px solid #1a2332"}}>
+                <div style={{fontSize:10,color:"#334155",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>✨ AI Assist</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>
+                  {[["email","📧 Email"],["cv","📄 CV Bullets"],["score","⚡ Score"]].map(([m,l])=>(
+                    <button key={m} className={`pill${aiMode===m?" on":""}`} onClick={()=>setAiMode(m)}>{l}</button>
+                  ))}
+                </div>
+                <button onClick={()=>runAI(sel)} disabled={aiLoad}
+                  style={{width:"100%",background:aiLoad?"#1a2332":"#00d4aa18",color:aiLoad?"#334155":"#00d4aa",border:"1px solid #00d4aa33",padding:"9px",borderRadius:7,cursor:aiLoad?"not-allowed":"pointer",fontSize:13,fontWeight:600,fontFamily:"'Inter',sans-serif",marginBottom:10}}>
+                  {aiLoad?"⏳ Generating...":aiMode==="email"?"Generate Cold Email":aiMode==="cv"?"Generate CV Bullets":"Score This Job"}
+                </button>
+                {!apiKey&&<div style={{fontSize:11,color:"#f59e0b",marginBottom:8}}>⚠️ Add API key via ⚙ API button — supports OpenAI (GPT-4o mini) or Anthropic</div>}
+                {aiOut&&(
+                  <div>
+                    <div className="aio">{aiOut}</div>
+                    <button className="cpbtn" style={{marginTop:8,width:"100%",padding:"7px"}} onClick={()=>{navigator.clipboard?.writeText(aiOut);flash("📋 Copied!");}}>
+                      📋 Copy all
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* description */}
+              {sel.description&&(
+                <div style={{padding:"12px 16px",borderBottom:"1px solid #1a2332"}}>
+                  <div style={{fontSize:10,color:"#334155",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>Description</div>
+                  <div style={{fontSize:12,color:"#64748b",lineHeight:1.7,maxHeight:180,overflowY:"auto",background:"#080b10",padding:"10px",borderRadius:6,border:"1px solid #1a2332",whiteSpace:"pre-wrap"}}>{sel.description}</div>
+                </div>
+              )}
+
+              {/* notes */}
+              <div style={{padding:"12px 16px"}}>
+                <div style={{fontSize:10,color:"#334155",marginBottom:8,textTransform:"uppercase",letterSpacing:1}}>My Notes (auto-saved)</div>
+                <textarea rows={3} value={note} placeholder="Add notes here..."
+                  onChange={e=>{setNote(e.target.value);saveNote(sel.id,e.target.value);}}
+                  style={{width:"100%",padding:"10px",fontSize:12,resize:"vertical",lineHeight:1.6}}/>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── PIPELINE BOARD ── */}
+      {view==="pipeline" && jobs.length>0 && (
+        <div style={{padding:16,overflowX:"auto"}}>
+          <div style={{display:"grid",gridTemplateColumns:`repeat(${STAGES.length},minmax(170px,1fr))`,gap:10,minWidth:800}}>
+            {STAGES.map(stage=>{
+              const sJobs=jobs.filter(j=>(tracker[j.id]?.stage||"New")===stage);
+              const col=S_COLOR[stage];
+              return (
+                <div key={stage}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,padding:"7px 10px",background:"#0d1117",borderRadius:8,border:`1px solid ${col}33`}}>
+                    <span style={{fontSize:12,fontWeight:700,color:col}}>{S_ICON[stage]} {stage}</span>
+                    <span style={{fontSize:11,background:col+"22",color:col,padding:"2px 8px",borderRadius:20,fontWeight:700}}>{sJobs.length}</span>
+                  </div>
+                  {sJobs.slice(0,10).map(j=>(
+                    <div key={j.id} className="card" style={{padding:"9px 11px",marginBottom:7,cursor:"pointer"}}
+                      onClick={()=>{setSel(j);setNote(tracker[j.id]?.note||"");setView("list");}}>
+                      <div style={{fontSize:12,fontWeight:600,color:"#e2e8f0",marginBottom:3,lineHeight:1.3}}>{j.title?.slice(0,42)}{j.title?.length>42?"…":""}</div>
+                      <div style={{fontSize:11,color:"#3b82f6"}}>{j.company?.slice(0,28)}</div>
+                      {j.salary&&<div style={{fontSize:10,color:"#22c55e",marginTop:2}}>{j.salary}</div>}
+                      {j.contacts?.some(c=>c.email)&&<div style={{fontSize:10,color:"#00d4aa",marginTop:2}}>📧 contact found</div>}
+                    </div>
+                  ))}
+                  {sJobs.length>10&&<div style={{fontSize:11,color:"#334155",textAlign:"center",paddingTop:4}}>+{sJobs.length-10} more</div>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── HOT COMPANIES ── */}
+      {view==="hot" && jobs.length>0 && (
+        <div style={{padding:20,maxWidth:680,margin:"0 auto"}}>
+          <div style={{marginBottom:14}}>
+            <div style={{fontSize:17,fontWeight:700,color:"#e2e8f0",marginBottom:4}}>🔥 Actively Hiring</div>
+            <div style={{fontSize:12,color:"#475569"}}>Ranked by number of open listings — highest activity = faster decisions.</div>
+          </div>
+          {hotCos.map(([co,cnt])=>{
+            const coJobs=jobs.filter(j=>j.company===co);
+            const hasEmail=coJobs.some(j=>j.contacts?.some(c=>c.email));
+            const hasVisa=coJobs.some(j=>j.sponsorship===true);
+            const pct=Math.min(100,(cnt/hotCos[0][1])*100);
+            return (
+              <div key={co} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"11px 14px",background:"#0d1117",border:"1px solid #1a2332",borderRadius:8,marginBottom:7,cursor:"pointer",transition:"border-color .15s"}}
+                onMouseEnter={e=>e.currentTarget.style.borderColor="#00d4aa33"}
+                onMouseLeave={e=>e.currentTarget.style.borderColor="#1a2332"}
+                onClick={()=>{setFilter(f=>({...f,search:co,stage:"all"}));setView("list");}}>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:3}}>
+                    <span style={{fontWeight:700,color:"#e2e8f0",fontSize:13}}>{co}</span>
+                    {hasVisa&&<span className="tag" style={{background:"#0a2218",color:"#4ade80",border:"1px solid #166534"}}>✅ Visa</span>}
+                    {hasEmail&&<span className="tag" style={{background:"#0a1a2e",color:"#60a5fa",border:"1px solid #1e3a5f"}}>📧</span>}
+                  </div>
+                  <div style={{fontSize:11,color:"#334155"}}>{coJobs[0]?.source}</div>
+                  <div className="pbar"><div className="pfill" style={{width:`${pct}%`,background:"#00d4aa"}}></div></div>
+                </div>
+                <div style={{marginLeft:16,textAlign:"right",flexShrink:0}}>
+                  <div style={{fontSize:22,fontWeight:700,color:"#00d4aa"}} className="mono">{cnt}</div>
+                  <div style={{fontSize:10,color:"#334155"}}>jobs</div>
+                </div>
+              </div>
+            );
+          })}
+          <div style={{marginTop:14,padding:"12px 14px",background:"#0d1117",border:"1px solid #1a2332",borderRadius:8,fontSize:12,color:"#475569",lineHeight:1.8}}>
+            💡 <span style={{color:"#e2e8f0",fontWeight:600}}>ITOL Recruit & IT Career Switch</span> — training/placement firms, great for career changers.<br/>
+            <span style={{color:"#e2e8f0",fontWeight:600}}>Accenture & FDM Group</span> — known visa sponsors. Click to see their specific openings.
+          </div>
+        </div>
+      )}
+
+      {/* ── STATS ── */}
+      {view==="stats" && jobs.length>0 && (
+        <div style={{padding:20,maxWidth:760,margin:"0 auto"}}>
+          <div style={{fontSize:17,fontWeight:700,color:"#e2e8f0",marginBottom:16}}>◎ Application Stats</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10,marginBottom:18}}>
+            {[["Total",jobs.length,"#3b82f6"],["Emails",withEmail,"#00d4aa"],["Applied",applied,"#8b5cf6"],["Interviews",interviews,"#06b6d4"],["Offers",offers,"#22c55e"],["With Visa",jobs.filter(j=>j.sponsorship===true).length,"#f59e0b"]].map(([l,v,c])=>(
+              <div key={l} style={{background:"#0d1117",border:"1px solid #1a2332",borderRadius:9,padding:"14px",textAlign:"center"}}>
+                <div style={{fontSize:26,fontWeight:700,color:c}} className="mono">{v}</div>
+                <div style={{fontSize:10,color:"#334155",marginTop:3,textTransform:"uppercase",letterSpacing:1}}>{l}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{background:"#0d1117",border:"1px solid #1a2332",borderRadius:9,padding:16,marginBottom:14}}>
+            <div style={{fontSize:10,color:"#334155",marginBottom:12,textTransform:"uppercase",letterSpacing:1}}>Pipeline</div>
+            {STAGES.map(s=>{
+              const n=stageCounts[s]; const pct=jobs.length?Math.round((n/jobs.length)*100):0; const col=S_COLOR[s];
+              return (
+                <div key={s} style={{marginBottom:9}}>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:4,fontSize:12}}>
+                    <span style={{color:col}}>{S_ICON[s]} {s}</span>
+                    <span className="mono" style={{color:"#475569"}}>{n} <span style={{color:"#334155"}}>({pct}%)</span></span>
+                  </div>
+                  <div className="pbar"><div className="pfill" style={{width:`${pct}%`,background:col}}></div></div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{padding:"14px 16px",background:"#0a1a0a",border:"1px solid #166534",borderRadius:9,fontSize:13,color:"#86efac",lineHeight:1.8}}>
+            🎯 <strong>Daily target: 5 applications/day = 150/month</strong><br/>
+            Progress: <strong>{applied} applied</strong> of {jobs.length} total
+            {applied===0?" — Start with Hot Companies tab. ITOL Recruit and FDM Group first.":
+             applied<20?" — Good start. Keep the daily habit going.":
+             " — Strong! Focus on following up on Interview stage."}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

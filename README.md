@@ -91,6 +91,6 @@ HTML dashboard → full pipeline tracking
 ## Built By
 
 **Malik Ibrahim** — Technical PM & Automation Engineer  
-[malikibrahim.dev](https://malikibrahim.dev) · [LinkedIn](https://linkedin.com/in/YOUR_LINKEDIN) · [GitHub](https://github.com/maliksystems)
+[malikibrahim.dev](https://malikibrahim.dev) · [LinkedIn](https://linkedin.com/in/ialmuqeet/) · [GitHub](https://github.com/maliksystems)
 
 > Built and used in production during my own job search. The best proof of concept is using your own tool.

@@ -84,6 +84,7 @@ HTML dashboard → full pipeline tracking
 ## Screenshots
 
 > *![JobRadar Dashboard](jobradar-screenshot.png)*
+> *565 jobs found across 6 boards — with direct HR contact emails and AI email generation*
 
 ---
 

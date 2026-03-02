@@ -83,7 +83,7 @@ HTML dashboard → full pipeline tracking
 
 ## Screenshots
 
-> *![JobRadar Dashboard](screenshot.png)*
+> *![JobRadar Dashboard](jobradar-screenshot.png)*
 
 ---
 
